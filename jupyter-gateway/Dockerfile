@@ -6,7 +6,7 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 RUN apt-get update \
     && apt-get install -y --no-install-recommends curl \
     && rm -rf /var/lib/apt/lists/* \
-    && pip install --no-cache-dir jupyter_kernel_gateway ipykernel
+    && pip install --no-cache-dir jupyter_kernel_gateway==3.0.1 ipykernel==7.1.0
 
 EXPOSE 9888
 
