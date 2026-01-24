@@ -28,6 +28,7 @@ _TOKEN = config.KERNEL_GATEWAY_TOKEN
 _KERNELS: dict[str, str] = {}
 _KERNEL_LAST_USED: dict[str, float] = {}
 _LOCKS: dict[str, asyncio.Lock] = {}
+_GLOBAL_KERNEL_LOCK = asyncio.Lock()
 _CLEANUP_TASK: asyncio.Task | None = None
 
 SESSION_TIMEOUT_SECONDS = 3600
@@ -79,29 +80,40 @@ def _ws_url(http_url: str) -> str:
 
 
 def clear_session(session_id: str) -> None:
-    kernel_id = _KERNELS.pop(session_id, None)
-    _KERNEL_LAST_USED.pop(session_id, None)
-    _LOCKS.pop(session_id, None)
-    if not kernel_id:
-        return
-
-    base_url = _BASE_URL
-    if not base_url:
-        return
-
-    async def _delete() -> None:
-        async with httpx.AsyncClient(
-            base_url=base_url, timeout=10, headers=_auth_headers()
-        ) as client:
-            with contextlib.suppress(Exception):
-                await client.delete(f"/api/kernels/{kernel_id}")
+    async def _run() -> None:
+        await _clear_session_async(session_id)
 
     try:
         loop = asyncio.get_running_loop()
     except RuntimeError:
-        asyncio.run(_delete())
+        asyncio.run(_run())
     else:
-        loop.create_task(_delete())
+        loop.create_task(_run())
+
+
+async def _delete_kernel(session_id: str, kernel_id: str) -> None:
+    base_url = _BASE_URL
+    if not base_url:
+        return
+    async with httpx.AsyncClient(
+        base_url=base_url, timeout=10, headers=_auth_headers()
+    ) as client:
+        try:
+            resp = await client.delete(f"/api/kernels/{kernel_id}")
+            resp.raise_for_status()
+            logger.info(f"[session={session_id}] deleted kernel={kernel_id}")
+        except Exception as e:
+            logger.warning(
+                f"[session={session_id}] failed to delete kernel={kernel_id}: {e}"
+            )
+
+
+async def _clear_session_async(session_id: str) -> None:
+    kernel_id = _KERNELS.pop(session_id, None)
+    _KERNEL_LAST_USED.pop(session_id, None)
+    _LOCKS.pop(session_id, None)
+    if kernel_id:
+        await _delete_kernel(session_id, kernel_id)
 
 
 async def _dump_kernel_state(
@@ -155,7 +167,7 @@ async def _evict_lru_session(redis_client: Any) -> None:
                     ex=REDIS_STATE_TTL,
                 )
 
-    clear_session(lru_session)
+    await _clear_session_async(lru_session)
 
 
 async def _cleanup_expired_sessions() -> None:
@@ -168,7 +180,7 @@ async def _cleanup_expired_sessions() -> None:
             if now - last_used > SESSION_TIMEOUT_SECONDS
         ]
         for sid in expired:
-            clear_session(sid)
+            await _clear_session_async(sid)
 
 
 def _ensure_cleanup_task() -> None:
@@ -193,28 +205,35 @@ async def _get_kernel_id(session_id: str, redis_client: Any = None) -> str:
         if existing:
             return existing
 
-        if len(_KERNELS) >= MAX_ACTIVE_SESSIONS and redis_client:
-            await _evict_lru_session(redis_client)
+        async with _GLOBAL_KERNEL_LOCK:
+            existing = _KERNELS.get(session_id)
+            if existing:
+                return existing
 
-        async with httpx.AsyncClient(
-            base_url=base_url, timeout=20, headers=_auth_headers()
-        ) as client:
-            resp = await client.post("/api/kernels", json={"name": "python3"})
-            resp.raise_for_status()
-            kernel_id = str(resp.json()["id"])
-            _KERNELS[session_id] = kernel_id
-            logger.info(f"[session={session_id}] started new kernel={kernel_id}")
+            while len(_KERNELS) >= MAX_ACTIVE_SESSIONS:
+                await _evict_lru_session(redis_client)
 
-            if redis_client:
-                with contextlib.suppress(Exception):
-                    state_b64 = redis_client.get(f"{REDIS_STATE_PREFIX}{session_id}")
-                    if state_b64:
-                        if isinstance(state_b64, bytes):
-                            state_b64 = state_b64.decode("utf-8")
-                        await _load_kernel_state(session_id, kernel_id, state_b64)
-                        redis_client.delete(f"{REDIS_STATE_PREFIX}{session_id}")
+            async with httpx.AsyncClient(
+                base_url=base_url, timeout=20, headers=_auth_headers()
+            ) as client:
+                resp = await client.post("/api/kernels", json={"name": "python3"})
+                resp.raise_for_status()
+                kernel_id = str(resp.json()["id"])
+                _KERNELS[session_id] = kernel_id
+                logger.info(f"[session={session_id}] started new kernel={kernel_id}")
 
-            return kernel_id
+                if redis_client:
+                    with contextlib.suppress(Exception):
+                        state_b64 = redis_client.get(
+                            f"{REDIS_STATE_PREFIX}{session_id}"
+                        )
+                        if state_b64:
+                            if isinstance(state_b64, bytes):
+                                state_b64 = state_b64.decode("utf-8")
+                            await _load_kernel_state(session_id, kernel_id, state_b64)
+                            redis_client.delete(f"{REDIS_STATE_PREFIX}{session_id}")
+
+                return kernel_id
 
 
 async def _execute_v1(code: str, timeout: float, kernel_id: str) -> dict[str, Any]:
