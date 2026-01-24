@@ -121,13 +121,37 @@ async def _dump_kernel_state(
 ) -> str | None:
     try:
         result = await _execute_v1(DUMP_VARS_CODE, timeout, kernel_id)
+        state_b64: str | None = None
         stdout = result.get("stdout", "")
         if stdout:
+            state_b64 = stdout
+        else:
+            raw = result.get("result")
+            if isinstance(raw, str) and raw:
+                raw = raw.strip()
+                if (
+                    len(raw) >= 2
+                    and raw[0] == raw[-1]
+                    and raw[0] in {"'", '"'}
+                    and re.fullmatch(r"[A-Za-z0-9+/=]+", raw[1:-1] or "")
+                ):
+                    raw = raw[1:-1]
+                if re.fullmatch(r"[A-Za-z0-9+/=]+", raw):
+                    state_b64 = raw
+
+        if state_b64:
             logger.info(
-                f"[session={session_id}] dumped state, size={len(stdout)} bytes"
+                f"[session={session_id}] dumped state, size={len(state_b64)} bytes"
             )
-            return stdout
-        logger.warning(f"[session={session_id}] dump returned empty state")
+            return state_b64
+
+        stderr = result.get("stderr", "")
+        if stderr:
+            logger.warning(
+                f"[session={session_id}] dump returned empty state, stderr={stderr[:500]!r}"
+            )
+        else:
+            logger.warning(f"[session={session_id}] dump returned empty state")
         return None
     except Exception as e:
         logger.error(f"[session={session_id}] dump failed: {e}")

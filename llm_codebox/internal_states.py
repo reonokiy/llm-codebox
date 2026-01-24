@@ -24,7 +24,7 @@ def _dump_session_state():
         except Exception:
             pass
     
-    print(base64.b64encode(pickle.dumps(state)).decode('utf-8'), end='')
+    return base64.b64encode(pickle.dumps(state)).decode('utf-8')
 
 _dump_session_state()
 """
