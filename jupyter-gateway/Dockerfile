@@ -1,12 +1,20 @@
-FROM python:3.12-slim
+FROM pytorch/pytorch:2.10.0-cuda12.8-cudnn9-runtime
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1
 
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends curl \
-    && rm -rf /var/lib/apt/lists/* \
-    && pip install --no-cache-dir jupyter_kernel_gateway==3.0.1 ipykernel==7.1.0
+    && apt-get install -y --no-install-recommends curl wget git build-essential \
+      # for OpenCV
+      libgl1 libglib2.0-0 \ 
+      # for Tesseract OCR
+      tesseract-ocr tesseract-ocr-eng tesseract-ocr-chi-sim tesseract-ocr-chi-tra \
+      # chinese fonts
+      fonts-noto-cjk \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY requirements.txt /tmp/requirements.txt
+RUN pip install --no-cache-dir --break-system-packages -r /tmp/requirements.txt && rm /tmp/requirements.txt
 
 EXPOSE 9888
 

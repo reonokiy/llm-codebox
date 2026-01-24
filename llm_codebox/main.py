@@ -10,7 +10,8 @@ import uvicorn
 
 from . import config
 import redis
-from .client import clear_session, run_jupyter_code
+from .client import clear_session, run_jupyter_code, run_jupyter_code_v1
+
 
 class RunJupyterRequest(BaseModel):
     session_id: str = Field(default="JupyterSandboxDefault")
@@ -25,8 +26,30 @@ class RunJupyterRequest(BaseModel):
         return value
 
 
+class JupyterOutputV2(BaseModel):
+    stdout: str = ""
+    stderr: str = ""
+    stdout_raw: str = ""
+    stderr_raw: str = ""
+    images: list[str] = Field(default_factory=list)
+
+
 class RunJupyterResponse(BaseModel):
-    output: str
+    output: JupyterOutputV2
+    status: str
+    execution_time: float
+
+
+class JupyterOutputV1(BaseModel):
+    result: str | None = None
+    stdout: str = ""
+    stderr: str = ""
+    images: list[str] = Field(default_factory=list)
+    debug_info: dict[str, str] = Field(default_factory=lambda: {"msg": ""})
+
+
+class RunJupyterResponseV1(BaseModel):
+    output: JupyterOutputV1
     status: str
     execution_time: float
 
@@ -45,6 +68,7 @@ class HealthResponse(BaseModel):
 
 app = FastAPI()
 
+
 def _init_redis() -> redis.Redis:
     url = config.REDIS_URL
     if url:
@@ -59,17 +83,38 @@ semaphore = asyncio.Semaphore(max(1, config.MAX_CONCURRENT_RUNS))
 
 
 @app.post("/run_jupyter", response_model=RunJupyterResponse)
-async def query(request: RunJupyterRequest) -> RunJupyterResponse:
+async def run_jupyter(request: RunJupyterRequest) -> RunJupyterResponse:
     session_id = request.session_id
     code_str = request.code
     timeout = request.timeout
     start_time = time.time()
     async with semaphore:
-        jupyter_output = await run_jupyter_code(redis_client, session_id, code_str, timeout)
+        output_dict = await run_jupyter_code(
+            redis_client, session_id, code_str, timeout
+        )
     execution_time = float(time.time() - start_time)
 
     return RunJupyterResponse(
-        output=jupyter_output,
+        output=JupyterOutputV2(**output_dict),
+        status="success",
+        execution_time=execution_time,
+    )
+
+
+@app.post("/jupyter_sandbox", response_model=RunJupyterResponseV1)
+async def jupyter_sandbox_v1(request: RunJupyterRequest) -> RunJupyterResponseV1:
+    session_id = request.session_id
+    code_str = request.code
+    timeout = request.timeout
+    start_time = time.time()
+    async with semaphore:
+        output_dict = await run_jupyter_code_v1(
+            redis_client, session_id, code_str, timeout
+        )
+    execution_time = float(time.time() - start_time)
+
+    return RunJupyterResponseV1(
+        output=JupyterOutputV1(**output_dict),
         status="success",
         execution_time=execution_time,
     )

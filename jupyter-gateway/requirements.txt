@@ -1,0 +1,14 @@
+numpy==2.4.1
+scipy==1.17.0
+pandas==3.0.0
+sympy==1.14.0
+matplotlib==3.10.8
+seaborn==0.13.2
+pillow==12.1.0
+opencv-python==4.13.0.90
+pytesseract==0.3.13
+easyocr==1.7.2
+scikit-learn==1.8.0
+# jupyter kernel gateway for running Jupyter notebooks as a service
+jupyter_kernel_gateway==3.0.1
+ipykernel==7.1.0

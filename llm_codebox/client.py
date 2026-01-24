@@ -2,6 +2,7 @@ import asyncio
 import contextlib
 import datetime as _dt
 import json
+import re
 import time
 import uuid
 from typing import Any
@@ -10,6 +11,11 @@ import httpx
 import websockets
 
 from . import config
+
+
+def _strip_ansi(s: str) -> str:
+    ansi_escape = re.compile(r"\x1B\[[0-?]*[ -/]*[@-~]")
+    return ansi_escape.sub("", s)
 
 
 _BASE_URL = config.KERNEL_GATEWAY_URL
@@ -83,7 +89,8 @@ async def _get_kernel_id(session_id: str) -> str:
             return kernel_id
 
 
-async def _execute(code: str, timeout: float, kernel_id: str) -> str:
+async def _execute_v1(code: str, timeout: float, kernel_id: str) -> dict[str, Any]:
+    """V1 format: result/stdout/stderr/images (pure base64)/debug_info."""
     base_url = _require_base_url()
     ws = _ws_url(base_url)
     ws_url = f"{ws}/api/kernels/{kernel_id}/channels"
@@ -106,17 +113,20 @@ async def _execute(code: str, timeout: float, kernel_id: str) -> str:
         "content": {
             "code": code,
             "silent": False,
-            "store_history": False,
+            "store_history": True,
             "user_expressions": {},
             "allow_stdin": False,
-            "stop_on_error": True,
+            "stop_on_error": False,
         },
         "channel": "shell",
         "buffers": [],
     }
 
     deadline = time.monotonic() + max(0.1, timeout)
-    chunks: list[str] = []
+    stdout_parts: list[str] = []
+    stderr_parts: list[str] = []
+    images: list[str] = []
+    result: str | None = None
 
     async with websockets.connect(
         ws_url,
@@ -128,13 +138,13 @@ async def _execute(code: str, timeout: float, kernel_id: str) -> str:
         while True:
             remaining = deadline - time.monotonic()
             if remaining <= 0:
-                chunks.append("Error: execution timed out")
+                stderr_parts.append("Timed out waiting for Jupyter kernel output.\n")
                 break
 
             try:
                 raw = await asyncio.wait_for(sock.recv(), timeout=remaining)
             except asyncio.TimeoutError:
-                chunks.append("Error: execution timed out")
+                stderr_parts.append("Timed out waiting for Jupyter kernel output.\n")
                 break
 
             try:
@@ -150,28 +160,166 @@ async def _execute(code: str, timeout: float, kernel_id: str) -> str:
             content = msg.get("content") or {}
 
             if msg_type == "stream":
-                text = content.get("text")
+                text = content.get("text", "")
                 if text:
-                    chunks.append(str(text))
+                    if content.get("name") == "stderr":
+                        stderr_parts.append(text)
+                    else:
+                        stdout_parts.append(text)
+            elif msg_type == "error":
+                tb = content.get("traceback")
+                if tb:
+                    stderr_parts.append("\n".join(str(x) for x in tb))
+                else:
+                    ename = content.get("ename", "")
+                    evalue = content.get("evalue", "")
+                    stderr_parts.append(f"{ename}: {evalue}".strip())
             elif msg_type in {"execute_result", "display_data"}:
                 data = content.get("data") or {}
-                if "text/plain" in data:
-                    chunks.append(str(data["text/plain"]))
-            elif msg_type == "error":
-                tb = content.get("traceback") or []
-                chunks.append("\n".join(str(x) for x in tb) or "Error")
+                if "image/png" in data:
+                    images.append(data["image/png"])
+                elif "image/jpeg" in data:
+                    images.append(data["image/jpeg"])
+                elif "text/plain" in data:
+                    if msg_type == "execute_result":
+                        result = str(data["text/plain"])
+                    else:
+                        stdout_parts.append(str(data["text/plain"]))
             elif msg_type == "status" and content.get("execution_state") == "idle":
                 break
 
-    return "".join(chunks).strip()
+    return {
+        "result": result,
+        "stdout": _strip_ansi("".join(stdout_parts)),
+        "stderr": _strip_ansi("".join(stderr_parts)),
+        "images": images,
+        "debug_info": {"msg": ""},
+    }
+
+
+async def _execute(code: str, timeout: float, kernel_id: str) -> dict[str, Any]:
+    """V2 format: stdout/stderr/stdout_raw/stderr_raw/images (with data URI prefix)."""
+    base_url = _require_base_url()
+    ws = _ws_url(base_url)
+    ws_url = f"{ws}/api/kernels/{kernel_id}/channels"
+
+    msg_id = uuid.uuid4().hex
+    session = uuid.uuid4().hex
+    now = _dt.datetime.now(tz=_dt.timezone.utc).isoformat()
+
+    execute_request = {
+        "header": {
+            "msg_id": msg_id,
+            "username": "",
+            "session": session,
+            "date": now,
+            "msg_type": "execute_request",
+            "version": "5.3",
+        },
+        "parent_header": {},
+        "metadata": {},
+        "content": {
+            "code": code,
+            "silent": False,
+            "store_history": True,
+            "user_expressions": {},
+            "allow_stdin": False,
+            "stop_on_error": False,
+        },
+        "channel": "shell",
+        "buffers": [],
+    }
+
+    deadline = time.monotonic() + max(0.1, timeout)
+    stdout_parts: list[str] = []
+    stderr_parts: list[str] = []
+    images: list[str] = []
+
+    async with websockets.connect(
+        ws_url,
+        max_size=32 * 1024 * 1024,
+        additional_headers=_auth_headers() or None,
+    ) as sock:
+        await sock.send(json.dumps(execute_request))
+
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                stderr_parts.append("Timed out waiting for Jupyter kernel output.\n")
+                break
+
+            try:
+                raw = await asyncio.wait_for(sock.recv(), timeout=remaining)
+            except asyncio.TimeoutError:
+                stderr_parts.append("Timed out waiting for Jupyter kernel output.\n")
+                break
+
+            try:
+                msg = json.loads(raw)
+            except Exception:
+                continue
+
+            parent = (msg.get("parent_header") or {}).get("msg_id")
+            if parent != msg_id:
+                continue
+
+            msg_type = (msg.get("header") or {}).get("msg_type")
+            content = msg.get("content") or {}
+
+            if msg_type == "stream":
+                text = content.get("text", "")
+                if text:
+                    if content.get("name") == "stderr":
+                        stderr_parts.append(text)
+                    else:
+                        stdout_parts.append(text)
+            elif msg_type == "error":
+                tb = content.get("traceback")
+                if tb:
+                    stderr_parts.append("\n".join(str(x) for x in tb))
+                else:
+                    ename = content.get("ename", "")
+                    evalue = content.get("evalue", "")
+                    stderr_parts.append(f"{ename}: {evalue}".strip())
+            elif msg_type in {"execute_result", "display_data"}:
+                data = content.get("data") or {}
+                if "image/png" in data:
+                    images.append(f"data:image/png;base64,{data['image/png']}")
+                elif "image/jpeg" in data:
+                    images.append(f"data:image/jpeg;base64,{data['image/jpeg']}")
+                elif "text/plain" in data:
+                    text = data["text/plain"]
+                    stdout_parts.append(text if text.endswith("\n") else f"{text}\n")
+            elif msg_type == "status" and content.get("execution_state") == "idle":
+                break
+
+    stdout_raw = "".join(stdout_parts)
+    stderr_raw = "".join(stderr_parts)
+
+    return {
+        "stdout": _strip_ansi(stdout_raw),
+        "stderr": _strip_ansi(stderr_raw),
+        "stdout_raw": stdout_raw,
+        "stderr_raw": stderr_raw,
+        "images": images,
+    }
 
 
 async def run_jupyter_code(
     redis_client: Any, session_id: str, code: str, timeout: float
-) -> str:
-    # Best-effort: keep a marker in Redis so callers can observe sessions.
+) -> dict[str, Any]:
     with contextlib.suppress(Exception):
         redis_client.set(session_id, b"1", ex=3600)
 
     kernel_id = await _get_kernel_id(session_id)
     return await _execute(code, timeout, kernel_id)
+
+
+async def run_jupyter_code_v1(
+    redis_client: Any, session_id: str, code: str, timeout: float
+) -> dict[str, Any]:
+    with contextlib.suppress(Exception):
+        redis_client.set(session_id, b"1", ex=3600)
+
+    kernel_id = await _get_kernel_id(session_id)
+    return await _execute_v1(code, timeout, kernel_id)
