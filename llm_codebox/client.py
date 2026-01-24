@@ -2,6 +2,7 @@ import asyncio
 import contextlib
 import datetime as _dt
 import json
+import logging
 import re
 import time
 import uuid
@@ -11,6 +12,9 @@ import httpx
 import websockets
 
 from . import config
+from .internal_states import DUMP_VARS_CODE, LOAD_VARS_CODE
+
+logger = logging.getLogger(__name__)
 
 
 def _strip_ansi(s: str) -> str:
@@ -22,7 +26,35 @@ _BASE_URL = config.KERNEL_GATEWAY_URL
 _TOKEN = config.KERNEL_GATEWAY_TOKEN
 
 _KERNELS: dict[str, str] = {}
+_KERNEL_LAST_USED: dict[str, float] = {}
 _LOCKS: dict[str, asyncio.Lock] = {}
+_CLEANUP_TASK: asyncio.Task | None = None
+
+SESSION_TIMEOUT_SECONDS = 3600
+MAX_ACTIVE_SESSIONS = config.MAX_ACTIVE_SESSIONS
+REDIS_STATE_PREFIX = "jupyter_state:"
+REDIS_STATE_TTL = 3600 * 6
+
+
+def get_sessions_info() -> dict[str, Any]:
+    now = time.monotonic()
+    sessions = []
+    for session_id, kernel_id in _KERNELS.items():
+        last_used = _KERNEL_LAST_USED.get(session_id, now)
+        idle_seconds = now - last_used
+        sessions.append(
+            {
+                "session_id": session_id,
+                "kernel_id": kernel_id,
+                "status": "active",
+                "idle_seconds": round(idle_seconds, 1),
+            }
+        )
+    return {
+        "active_sessions": len(sessions),
+        "max_sessions": MAX_ACTIVE_SESSIONS,
+        "sessions": sessions,
+    }
 
 
 def _require_base_url() -> str:
@@ -48,6 +80,8 @@ def _ws_url(http_url: str) -> str:
 
 def clear_session(session_id: str) -> None:
     kernel_id = _KERNELS.pop(session_id, None)
+    _KERNEL_LAST_USED.pop(session_id, None)
+    _LOCKS.pop(session_id, None)
     if not kernel_id:
         return
 
@@ -70,14 +104,97 @@ def clear_session(session_id: str) -> None:
         loop.create_task(_delete())
 
 
-async def _get_kernel_id(session_id: str) -> str:
+async def _dump_kernel_state(
+    session_id: str, kernel_id: str, timeout: float = 30.0
+) -> str | None:
+    try:
+        result = await _execute_v1(DUMP_VARS_CODE, timeout, kernel_id)
+        stdout = result.get("stdout", "")
+        if stdout:
+            logger.info(
+                f"[session={session_id}] dumped state, size={len(stdout)} bytes"
+            )
+            return stdout
+        logger.warning(f"[session={session_id}] dump returned empty state")
+        return None
+    except Exception as e:
+        logger.error(f"[session={session_id}] dump failed: {e}")
+        return None
+
+
+async def _load_kernel_state(
+    session_id: str, kernel_id: str, state_b64: str, timeout: float = 30.0
+) -> bool:
+    try:
+        code = LOAD_VARS_CODE.format(state_b64=state_b64)
+        await _execute_v1(code, timeout, kernel_id)
+        logger.info(
+            f"[session={session_id}] restored state, size={len(state_b64)} bytes"
+        )
+        return True
+    except Exception as e:
+        logger.error(f"[session={session_id}] restore failed: {e}")
+        return False
+
+
+async def _evict_lru_session(redis_client: Any) -> None:
+    if not _KERNEL_LAST_USED:
+        return
+
+    lru_session = min(_KERNEL_LAST_USED.items(), key=lambda x: x[1])[0]
+    kernel_id = _KERNELS.get(lru_session)
+
+    if kernel_id:
+        logger.info(f"[session={lru_session}] evicting LRU session, kernel={kernel_id}")
+        state = await _dump_kernel_state(lru_session, kernel_id)
+        if state and redis_client:
+            with contextlib.suppress(Exception):
+                redis_client.set(
+                    f"{REDIS_STATE_PREFIX}{lru_session}",
+                    state,
+                    ex=REDIS_STATE_TTL,
+                )
+
+    clear_session(lru_session)
+
+
+async def _cleanup_expired_sessions() -> None:
+    while True:
+        await asyncio.sleep(60)
+        now = time.monotonic()
+        expired = [
+            sid
+            for sid, last_used in _KERNEL_LAST_USED.items()
+            if now - last_used > SESSION_TIMEOUT_SECONDS
+        ]
+        for sid in expired:
+            clear_session(sid)
+
+
+def _ensure_cleanup_task() -> None:
+    global _CLEANUP_TASK
+    if _CLEANUP_TASK is None or _CLEANUP_TASK.done():
+        try:
+            loop = asyncio.get_running_loop()
+            _CLEANUP_TASK = loop.create_task(_cleanup_expired_sessions())
+        except RuntimeError:
+            pass
+
+
+async def _get_kernel_id(session_id: str, redis_client: Any = None) -> str:
     base_url = _require_base_url()
     lock = _LOCKS.setdefault(session_id, asyncio.Lock())
 
     async with lock:
+        _KERNEL_LAST_USED[session_id] = time.monotonic()
+        _ensure_cleanup_task()
+
         existing = _KERNELS.get(session_id)
         if existing:
             return existing
+
+        if len(_KERNELS) >= MAX_ACTIVE_SESSIONS and redis_client:
+            await _evict_lru_session(redis_client)
 
         async with httpx.AsyncClient(
             base_url=base_url, timeout=20, headers=_auth_headers()
@@ -86,6 +203,17 @@ async def _get_kernel_id(session_id: str) -> str:
             resp.raise_for_status()
             kernel_id = str(resp.json()["id"])
             _KERNELS[session_id] = kernel_id
+            logger.info(f"[session={session_id}] started new kernel={kernel_id}")
+
+            if redis_client:
+                with contextlib.suppress(Exception):
+                    state_b64 = redis_client.get(f"{REDIS_STATE_PREFIX}{session_id}")
+                    if state_b64:
+                        if isinstance(state_b64, bytes):
+                            state_b64 = state_b64.decode("utf-8")
+                        await _load_kernel_state(session_id, kernel_id, state_b64)
+                        redis_client.delete(f"{REDIS_STATE_PREFIX}{session_id}")
+
             return kernel_id
 
 
@@ -308,18 +436,36 @@ async def _execute(code: str, timeout: float, kernel_id: str) -> dict[str, Any]:
 async def run_jupyter_code(
     redis_client: Any, session_id: str, code: str, timeout: float
 ) -> dict[str, Any]:
-    with contextlib.suppress(Exception):
-        redis_client.set(session_id, b"1", ex=3600)
-
-    kernel_id = await _get_kernel_id(session_id)
-    return await _execute(code, timeout, kernel_id)
+    kernel_id = await _get_kernel_id(session_id, redis_client)
+    code_preview = code[:200] + "..." if len(code) > 200 else code
+    logger.info(f"[session={session_id}] executing code: {code_preview!r}")
+    result = await _execute(code, timeout, kernel_id)
+    has_error = bool(result.get("stderr"))
+    logger.info(
+        f"[session={session_id}] execution done, "
+        f"stdout={len(result.get('stdout', ''))}b, "
+        f"stderr={len(result.get('stderr', ''))}b, "
+        f"images={len(result.get('images', []))}, "
+        f"error={has_error}"
+    )
+    return result
 
 
 async def run_jupyter_code_v1(
     redis_client: Any, session_id: str, code: str, timeout: float
 ) -> dict[str, Any]:
-    with contextlib.suppress(Exception):
-        redis_client.set(session_id, b"1", ex=3600)
-
-    kernel_id = await _get_kernel_id(session_id)
-    return await _execute_v1(code, timeout, kernel_id)
+    kernel_id = await _get_kernel_id(session_id, redis_client)
+    code_preview = code[:200] + "..." if len(code) > 200 else code
+    logger.info(f"[session={session_id}] executing code (v1): {code_preview!r}")
+    result = await _execute_v1(code, timeout, kernel_id)
+    has_error = bool(result.get("stderr"))
+    has_result = result.get("result") is not None
+    logger.info(
+        f"[session={session_id}] execution done (v1), "
+        f"result={has_result}, "
+        f"stdout={len(result.get('stdout', ''))}b, "
+        f"stderr={len(result.get('stderr', ''))}b, "
+        f"images={len(result.get('images', []))}, "
+        f"error={has_error}"
+    )
+    return result

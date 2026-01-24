@@ -4,13 +4,26 @@ from pydantic import BaseModel, Field, field_validator
 import asyncio
 import argparse
 import contextlib
+import logging
 import time
 
 import uvicorn
 
 from . import config
 import redis
-from .client import clear_session, run_jupyter_code, run_jupyter_code_v1
+from .client import (
+    clear_session,
+    run_jupyter_code,
+    run_jupyter_code_v1,
+    get_sessions_info,
+    REDIS_STATE_PREFIX,
+)
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s [%(name)s] %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+)
 
 
 class RunJupyterRequest(BaseModel):
@@ -64,6 +77,19 @@ class ClearSessionResponse(BaseModel):
 
 class HealthResponse(BaseModel):
     status: str
+
+
+class SessionInfo(BaseModel):
+    session_id: str
+    kernel_id: str | None = None
+    status: str
+    idle_seconds: float | None = None
+
+
+class SessionsResponse(BaseModel):
+    active_sessions: int
+    max_sessions: int
+    sessions: list[SessionInfo]
 
 
 app = FastAPI()
@@ -131,6 +157,35 @@ async def jupyter_sandbox(request: ClearSessionRequest) -> ClearSessionResponse:
 @app.get("/health", response_model=HealthResponse)
 async def health() -> HealthResponse:
     return HealthResponse(status="ok")
+
+
+@app.get("/sessions", response_model=SessionsResponse)
+async def list_sessions() -> SessionsResponse:
+    info = get_sessions_info()
+    sessions = [SessionInfo(**s) for s in info["sessions"]]
+
+    with contextlib.suppress(Exception):
+        keys: list[bytes] = redis_client.keys(f"{REDIS_STATE_PREFIX}*")  # type: ignore[assignment]
+        prefix_len = len(REDIS_STATE_PREFIX)
+        active_ids = {s.session_id for s in sessions}
+        for k in keys:
+            key_str = k.decode("utf-8") if isinstance(k, bytes) else k
+            session_id = key_str[prefix_len:]
+            if session_id not in active_ids:
+                sessions.append(
+                    SessionInfo(
+                        session_id=session_id,
+                        kernel_id=None,
+                        status="persisted",
+                        idle_seconds=None,
+                    )
+                )
+
+    return SessionsResponse(
+        active_sessions=info["active_sessions"],
+        max_sessions=info["max_sessions"],
+        sessions=sessions,
+    )
 
 
 if __name__ == "__main__":

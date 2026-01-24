@@ -165,6 +165,37 @@ Response body:
 }
 ```
 
+### `GET /sessions`
+
+List all active and persisted sessions.
+
+Response body:
+```json
+{
+  "active_sessions": 2,
+  "max_sessions": 16,
+  "sessions": [
+    {
+      "session_id": "abc123",
+      "kernel_id": "kernel-uuid-1",
+      "status": "active",
+      "idle_seconds": 45.2
+    },
+    {
+      "session_id": "xyz789",
+      "kernel_id": null,
+      "status": "persisted",
+      "idle_seconds": null
+    }
+  ]
+}
+```
+
+| Status | Description |
+|--------|-------------|
+| `active` | Kernel is running, `kernel_id` and `idle_seconds` available |
+| `persisted` | Kernel was evicted, state saved to Redis, will restore on next request |
+
 ## Configuration
 
 Environment variables used by the FastAPI service:
@@ -172,11 +203,12 @@ Environment variables used by the FastAPI service:
 - `KERNEL_GATEWAY_URL` (required): Base URL for the Jupyter Kernel Gateway.
 - `KERNEL_GATEWAY_TOKEN` (optional): Token for the Kernel Gateway auth header.
 - `REDIS_URL` (optional): Full Redis connection URL.
-- `REDIS_HOST` (default: `redis`)
+- `REDIS_HOST` (default: `valkey`)
 - `REDIS_PORT` (default: `6379`)
 - `REDIS_DB` (default: `0`)
 - `APP_PORT` (default: `12345`)
-- `MAX_CONCURRENT_RUNS` (default: `4`)
+- `MAX_CONCURRENT_RUNS` (default: `4`): Maximum concurrent code executions.
+- `MAX_ACTIVE_SESSIONS` (default: `MAX_CONCURRENT_RUNS`): Maximum active kernel sessions. When exceeded, LRU session is evicted to Redis.
 
 The provided `docker-compose.yaml` sets defaults for local usage.
 
