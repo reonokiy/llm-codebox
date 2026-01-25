@@ -6,6 +6,7 @@ import argparse
 import contextlib
 import logging
 import time
+from typing import Any, Protocol
 
 import uvicorn
 
@@ -95,6 +96,12 @@ class SessionsResponse(BaseModel):
 app = FastAPI()
 
 
+class RedisClient(Protocol):
+    def keys(self, pattern: Any = "*", **kwargs: Any) -> Any: ...
+
+    def delete(self, *names: Any) -> Any: ...
+
+
 def _init_redis() -> redis.Redis:
     url = config.REDIS_URL
     if url:
@@ -104,7 +111,7 @@ def _init_redis() -> redis.Redis:
     )
 
 
-redis_client = _init_redis()
+redis_client: RedisClient = _init_redis()
 semaphore = asyncio.Semaphore(max(1, config.MAX_CONCURRENT_RUNS))
 
 
@@ -150,7 +157,7 @@ async def jupyter_sandbox_v1(request: RunJupyterRequest) -> RunJupyterResponseV1
 async def jupyter_sandbox(request: ClearSessionRequest) -> ClearSessionResponse:
     clear_session(request.session_id)
     with contextlib.suppress(Exception):
-        redis_client.delete(request.session_id)
+        redis_client.delete(f"{REDIS_STATE_PREFIX}{request.session_id}")
     return ClearSessionResponse(status="success")
 
 
@@ -165,7 +172,7 @@ async def list_sessions() -> SessionsResponse:
     sessions = [SessionInfo(**s) for s in info["sessions"]]
 
     with contextlib.suppress(Exception):
-        keys: list[bytes] = redis_client.keys(f"{REDIS_STATE_PREFIX}*")  # type: ignore[assignment]
+        keys = redis_client.keys(f"{REDIS_STATE_PREFIX}*")
         prefix_len = len(REDIS_STATE_PREFIX)
         active_ids = {s.session_id for s in sessions}
         for k in keys:
