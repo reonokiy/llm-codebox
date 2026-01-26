@@ -6,9 +6,72 @@ https://github.com/ChenShawn/MultiModal-Jupyter-Sandbox.
 
 ## Architecture
 
-- `app`: FastAPI server (`llm_codebox.main`) that forwards code to Jupyter.
-- `jupyter`: Jupyter Kernel Gateway for executing Python code (with GPU support).
-- `valkey`: Redis-compatible store for session markers.
+```mermaid
+flowchart TB
+    subgraph app["Application Layer"]
+        main["main.py<br/>FastAPI App"]
+        api["api.py<br/>API Endpoints"]
+        config["config.py"]
+        logging["logging_setup.py"]
+    end
+    
+    subgraph jupyter["jupyter/ Package"]
+        init["__init__.py<br/>Public API"]
+        manager["manager.py<br/>KernelSessionManager"]
+        sessions["sessions.py<br/>SessionRegistry"]
+        channels["channels.py<br/>KernelChannels"]
+        executor["executor.py<br/>JupyterExecutor"]
+        gateway["gateway_http.py<br/>KernelGatewayClient"]
+        persistence["state_persistence.py<br/>StatePersistence"]
+        models["models.py<br/>ExecuteResult"]
+        types["types.py<br/>Protocols & TypedDicts"]
+        internal["internal_states.py<br/>Dump/Load Code"]
+    end
+    
+    subgraph external["External Services"]
+        redis[(Redis/Valkey)]
+        kernel[Jupyter Gateway]
+    end
+    
+    main --> api
+    main --> config
+    main --> logging
+    api --> init
+    init --> manager
+    manager --> sessions
+    manager --> channels
+    manager --> executor
+    sessions --> gateway
+    sessions --> persistence
+    persistence --> internal
+    persistence --> executor
+    executor --> channels
+    executor --> models
+    channels --> kernel
+    gateway --> kernel
+    persistence --> redis
+    sessions --> types
+```
+
+### Components
+
+| Component | Description |
+|-----------|-------------|
+| `main.py` | FastAPI application entry point |
+| `api.py` | API endpoints (`/run_jupyter`, `/jupyter_sandbox`, etc.) |
+| `jupyter/manager.py` | Coordinates kernel sessions, channels, and execution |
+| `jupyter/sessions.py` | Session-to-kernel mapping with LRU eviction |
+| `jupyter/channels.py` | WebSocket connection management for kernel communication |
+| `jupyter/executor.py` | Builds execute requests and collects output |
+| `jupyter/gateway_http.py` | REST client for Jupyter Kernel Gateway |
+| `jupyter/state_persistence.py` | Dumps/restores session state via Redis |
+| `jupyter/models.py` | Pydantic models for execution results |
+| `jupyter/types.py` | Type definitions (Protocols, TypedDicts) |
+
+### External Services
+
+- **Jupyter Kernel Gateway**: Executes Python code (with GPU support)
+- **Redis/Valkey**: Stores evicted session state for restoration
 
 Default setup uses the [Jupyter Kernel Gateway](https://github.com/jupyter-server/kernel_gateway). If you need scalable compute,
 deploy your own [enterprise gateway](https://github.com/jupyter-server/enterprise_gateway) and point `KERNEL_GATEWAY_URL` to it.
@@ -206,7 +269,7 @@ Environment variables used by the FastAPI service:
 - `REDIS_HOST` (default: `valkey`)
 - `REDIS_PORT` (default: `6379`)
 - `REDIS_DB` (default: `0`)
-- `APP_PORT` (default: `12345`)
+- `PORT` (default: `12345`)
 - `MAX_CONCURRENT_RUNS` (default: `4`): Maximum concurrent code executions.
 - `MAX_ACTIVE_SESSIONS` (default: `MAX_CONCURRENT_RUNS`): Maximum active kernel sessions. When exceeded, LRU session is evicted to Redis.
 

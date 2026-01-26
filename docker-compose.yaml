@@ -7,6 +7,7 @@ services:
       KERNEL_GATEWAY_URL: http://jupyter:9888
       REDIS_HOST: valkey
       REDIS_PORT: "6379"
+      LOG_LEVEL: "DEBUG"
     depends_on:
       - jupyter
       - valkey
