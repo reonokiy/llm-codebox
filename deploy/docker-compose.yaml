@@ -1,0 +1,70 @@
+services:
+  api:
+    image: ghcr.io/reonokiy/llm-codebox-api:main
+    ports:
+      - "12345:12345"
+    labels:
+      net.reonokiy.compose.project: "llm-codebox"
+      net.reonokiy.compose.service: "api"
+    environment:
+      KERNEL_GATEWAY_URL: http://jupyter:9888
+      REDIS_HOST: valkey
+      REDIS_PORT: "6379"
+      LOG_LEVEL: "INFO"
+    depends_on:
+      - jupyter
+      - valkey
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:12345/health >/dev/null"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+    restart: unless-stopped
+
+  jupyter:
+    image: ghcr.io/reonokiy/llm-codebox-jupyter:main
+    labels:
+      net.reonokiy.compose.project: "llm-codebox"
+      net.reonokiy.compose.service: "jupyter"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:9888/api >/dev/null"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    restart: unless-stopped
+
+  valkey:
+    image: valkey/valkey:8
+    labels:
+      net.reonokiy.compose.project: "llm-codebox"
+      net.reonokiy.compose.service: "valkey"
+    volumes:
+      - valkey-data:/data
+    healthcheck:
+      test: ["CMD", "valkey-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+    restart: unless-stopped
+
+  vector:
+    image: timberio/vector:0.52.0-debian
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - /var/lib/docker/containers:/var/lib/docker/containers:ro
+      - ./vector.yaml:/etc/vector/vector.yaml:ro
+      - ../.data/logs:/var/log/vector
+    environment:
+      VICTORIA_LOGS_URL: "http://victoria-logs:9428/insert/jsonline"
+    profiles: ["vector"]
+    restart: unless-stopped
+
+volumes:
+  valkey-data:

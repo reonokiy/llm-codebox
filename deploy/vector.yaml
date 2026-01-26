@@ -1,0 +1,141 @@
+sources:
+  docker:
+    type: docker_logs
+    include_labels:
+      - "net.reonokiy.compose.project=llm-codebox"
+
+transforms:
+  route_services:
+    type: route
+    inputs: [docker]
+    route:
+      api: '.label."net.reonokiy.compose.service" == "api"'
+      jupyter: '.label."net.reonokiy.compose.service" == "jupyter"'
+      valkey: '.label."net.reonokiy.compose.service" == "valkey"'
+  parse_api:
+    type: remap
+    inputs: [route_services.api]
+    source: |
+      original_message = .message
+      parsed = parse_json(original_message) ?? null
+      if parsed != null && is_object(parsed) {
+        . = merge!(., parsed)
+        if parsed.message != null {
+          .message = parsed.message
+        } else if parsed.event != null {
+          .message = parsed.event
+        } else if parsed.msg != null {
+          .message = parsed.msg
+        } else {
+          .message = original_message
+        }
+      }
+      if .level != null {
+        .level = downcase(string!(.level))
+      }
+      if .timestamp != null && is_string(.timestamp) {
+        parsed_ts = parse_timestamp(.timestamp, "%+") ?? null
+        if parsed_ts != null {
+          .timestamp = parsed_ts
+        }
+      }
+      .service = "api"
+  parse_jupyter:
+    type: remap
+    inputs: [route_services.jupyter]
+    source: |
+      original_message = .message
+      parsed = parse_json(original_message) ?? null
+      if parsed != null && is_object(parsed) {
+        . = merge!(., parsed)
+        if parsed.message != null {
+          .message = parsed.message
+        } else if parsed.event != null {
+          .message = parsed.event
+        } else if parsed.msg != null {
+          .message = parsed.msg
+        } else {
+          .message = original_message
+        }
+      }
+      if .message != null && is_string(.message) {
+        bracket = parse_regex(.message, r'^\[([A-Z]) ([^\]]+)\] (.*)$', numeric_groups: true) ?? null
+        if bracket != null {
+          if bracket."3" != null {
+            .message = bracket."3"
+          }
+          if .level == null && bracket."1" != null {
+            .level = if bracket."1" == "I" {
+              "info"
+            } else if bracket."1" == "W" {
+              "warn"
+            } else if bracket."1" == "E" {
+              "error"
+            } else if bracket."1" == "D" {
+              "debug"
+            } else {
+              "info"
+            }
+          }
+          if bracket."2" != null {
+            parsed_ts = parse_timestamp(bracket."2", "%Y-%m-%d %H:%M:%S%.f") ??
+              parse_timestamp(bracket."2", "%y%m%d %H:%M:%S") ??
+              null
+            if parsed_ts != null {
+              .timestamp = parsed_ts
+            }
+          }
+        }
+      }
+      .service = "jupyter"
+  parse_valkey:
+    type: remap
+    inputs: [route_services.valkey]
+    source: |
+      original_message = .message
+      parsed = parse_json(original_message) ?? null
+      if parsed != null && is_object(parsed) {
+        . = merge!(., parsed)
+        if parsed.message != null {
+          .message = parsed.message
+        } else if parsed.event != null {
+          .message = parsed.event
+        } else if parsed.msg != null {
+          .message = parsed.msg
+        } else {
+          .message = original_message
+        }
+      }
+      if .message != null && is_string(.message) {
+        valkey = parse_regex(.message, r'^(\d+:\w) (\d{2}) (\w{3}) (\d{4}) (\d{2}:\d{2}:\d{2}\.\d{3}) \* (.*)$', numeric_groups: true) ?? null
+        if valkey != null {
+          if valkey."6" != null {
+            .message = valkey."6"
+          }
+          if .level == null {
+            .level = "info"
+          }
+          ts_str = string!(valkey."2") + " " + string!(valkey."3") + " " + string!(valkey."4") + " " + string!(valkey."5")
+          parsed_ts = parse_timestamp(ts_str, "%d %b %Y %H:%M:%S%.f") ?? null
+          if parsed_ts != null {
+            .timestamp = parsed_ts
+          }
+        }
+      }
+      .service = "valkey"
+  to_jsonline:
+    type: remap
+    inputs: [parse_api, parse_jupyter, parse_valkey]
+    source: |
+      .stream = .stream
+
+sinks:
+  logs_file:
+    type: file
+    inputs: [to_jsonline]
+    path: "/var/log/vector/llm-codebox.json"
+    encoding:
+      codec: json
+  drop_unmatched:
+    type: blackhole
+    inputs: [route_services._unmatched]
